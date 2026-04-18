@@ -35,26 +35,31 @@ class Qwen3VLVisionAttention(nn.Module):
         key_states = key_states.transpose(0, 1).unsqueeze(0)
         value_states = value_states.transpose(0, 1).unsqueeze(0)
 
-        # Other implementations: Process each chunk separately
-        lengths = cu_seqlens[1:] - cu_seqlens[:-1]
-        splits = [
-            torch.split(tensor, lengths.tolist(), dim=2) for tensor in (query_states, key_states, value_states)
-        ]
-
-        attn_outputs = [
-            sdpa_attention_forward(
+        if len(cu_seqlens) == 2:
+            attn_output, _ = sdpa_attention_forward(
                 self,
-                q,
-                k,
-                v,
+                query_states, key_states, value_states,
                 attention_mask=None,
                 scaling=self.scaling,
                 dropout=0.0 if not self.training else self.attention_dropout,
-                is_causal=False
-            )[0]
-            for q, k, v in zip(*splits)
-        ]
-        attn_output = torch.cat(attn_outputs, dim=1)
+                is_causal=False,
+            )
+        else:
+            lengths = cu_seqlens[1:] - cu_seqlens[:-1]
+            splits = [
+                torch.split(tensor, lengths.tolist(), dim=2) for tensor in (query_states, key_states, value_states)
+            ]
+            attn_outputs = [
+                sdpa_attention_forward(
+                    self, q, k, v,
+                    attention_mask=None,
+                    scaling=self.scaling,
+                    dropout=0.0 if not self.training else self.attention_dropout,
+                    is_causal=False,
+                )[0]
+                for q, k, v in zip(*splits)
+            ]
+            attn_output = torch.cat(attn_outputs, dim=1)
 
         attn_output = attn_output.reshape(seq_length, -1).contiguous()
         attn_output = self.proj(attn_output)

@@ -10,7 +10,7 @@ from .transformer_utils import Cache, DynamicCache
 from .transformer_utils import GenerationConfig
 from dataclasses import dataclass
 from .text_context import set_context, reset_context
-from .pld_utils import pld_lookup_drafts
+from .graph import VG_MGR, VisualCudaGraph
 from .lookahead_n_gram import NGramMgr
 import itertools
 
@@ -183,9 +183,7 @@ class Qwen3VLModel(nn.Module):
         position_ids: torch.LongTensor | None = None,
         inputs_embeds: torch.FloatTensor | None = None,
         pixel_values: torch.Tensor | None = None,
-        pixel_values_videos: torch.FloatTensor | None = None,
         image_grid_thw: torch.LongTensor | None = None,
-        video_grid_thw: torch.LongTensor | None = None,
         mm_token_type_ids: torch.IntTensor | None = None
     ) -> tuple | Qwen3VLModelOutputWithPast:
         """
@@ -251,9 +249,9 @@ class Qwen3VLModel(nn.Module):
             The temporal, height and width of feature shape of each image in LLM.
         """
         pixel_values = pixel_values.type(self.visual.dtype)
-        vision_output: BaseModelOutputWithDeepstackFeatures = self.visual(
-            pixel_values, grid_thw=image_grid_thw
-        )
+        vg = VG_MGR.get(self.visual, image_grid_thw)
+        vision_output = vg.run(pixel_values, image_grid_thw)
+
         image_embeds = vision_output.pooler_output
         split_sizes = (image_grid_thw.prod(-1) // self.visual.spatial_merge_size**2).tolist()
         image_embeds = torch.split(image_embeds, split_sizes)
@@ -289,9 +287,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         position_ids: torch.LongTensor | None = None,
         inputs_embeds: torch.FloatTensor | None = None,
         pixel_values: torch.Tensor | None = None,
-        pixel_values_videos: torch.FloatTensor | None = None,
         image_grid_thw: torch.LongTensor | None = None,
-        video_grid_thw: torch.LongTensor | None = None,
         mm_token_type_ids: torch.IntTensor | None = None,
     ) -> tuple | Qwen3VLCausalLMOutputWithPast:
         """
@@ -300,9 +296,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         outputs = self.model(
             input_ids=input_ids,
             pixel_values=pixel_values,
-            pixel_values_videos=pixel_values_videos,
             image_grid_thw=image_grid_thw,
-            video_grid_thw=video_grid_thw,
             position_ids=position_ids,
             inputs_embeds=inputs_embeds,
             mm_token_type_ids=mm_token_type_ids
@@ -677,9 +671,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
             input_ids=input_ids,
             position_ids=position_ids,
             pixel_values=pixel_values,
-            pixel_values_videos=pixel_values_videos,
             image_grid_thw=image_grid_thw,
-            video_grid_thw=video_grid_thw,
             mm_token_type_ids=mm_token_type_ids,
         )
 

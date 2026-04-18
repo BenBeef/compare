@@ -6,6 +6,7 @@ from .vl_embeds import Qwen3VLVisionPatchEmbed, Qwen3VLVisionRotaryEmbedding
 from .vl_layer import Qwen3VLVisionBlock
 import torch.nn.functional as F
 from dataclasses import dataclass
+from .graph import VisualCudaGraph
 
 
 @dataclass
@@ -175,9 +176,20 @@ class Qwen3VLVisionModel(nn.Module):
         patch_pos_embeds = torch.cat(patch_pos_embeds_permute)
         return patch_pos_embeds
 
-    
+    def get_cu_seqlens(self, grid_thw: torch.Tensor):
+        cu_seqlens = torch.repeat_interleave(grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]).cumsum(
+            dim=0,
+            # Select dtype based on the following factors:
+            #  - FA2 requires that cu_seqlens_q must have dtype int32
+            #  - torch.onnx.export requires that cu_seqlens_q must have same dtype as grid_thw
+            # See https://github.com/huggingface/transformers/pull/34852 for more information
+            dtype=grid_thw.dtype if torch.jit.is_tracing() else torch.int32,
+        )
+        cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
+        return cu_seqlens
+
     def forward(
-        self, hidden_states: torch.Tensor, grid_thw: torch.Tensor
+        self, hidden_states: torch.Tensor, grid_thw: torch.Tensor, vg:VisualCudaGraph
     ) -> tuple | BaseModelOutputWithDeepstackFeatures:
         """
         Args:
@@ -191,10 +203,12 @@ class Qwen3VLVisionModel(nn.Module):
         """
         hidden_states = self.patch_embed(hidden_states)
 
-        pos_embeds = self.fast_pos_embed_interpolate(grid_thw)
+        # pos_embeds = self.fast_pos_embed_interpolate(grid_thw)
+        pos_embeds = vg.pos_embeds
         hidden_states = hidden_states + pos_embeds
 
-        rotary_pos_emb = self.rot_pos_emb(grid_thw)
+        # rotary_pos_emb = self.rot_pos_emb(grid_thw)
+        rotary_pos_emb = vg.rotary_pos_emb
 
         seq_len, _ = hidden_states.size()
         hidden_states = hidden_states.reshape(seq_len, -1)
@@ -202,15 +216,8 @@ class Qwen3VLVisionModel(nn.Module):
         emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
         position_embeddings = (emb.cos(), emb.sin())
 
-        cu_seqlens = torch.repeat_interleave(grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]).cumsum(
-            dim=0,
-            # Select dtype based on the following factors:
-            #  - FA2 requires that cu_seqlens_q must have dtype int32
-            #  - torch.onnx.export requires that cu_seqlens_q must have same dtype as grid_thw
-            # See https://github.com/huggingface/transformers/pull/34852 for more information
-            dtype=grid_thw.dtype if torch.jit.is_tracing() else torch.int32,
-        )
-        cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
+        # from visualCudaGraph
+        cu_seqlens = vg.cu_seqlens
 
         deepstack_feature_lists = []
         for layer_num, blk in enumerate(self.blocks):
