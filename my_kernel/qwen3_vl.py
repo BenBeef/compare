@@ -1,6 +1,8 @@
+import os
 from torch import nn
 import torch
 import time
+from typing import *
 
 from .vl_model import Qwen3VLVisionModel, BaseModelOutputWithDeepstackFeatures
 from .text_model import Qwen3VLTextModel
@@ -8,10 +10,12 @@ from .transformer_utils import Cache, DynamicCache
 from .transformer_utils import GenerationConfig
 from dataclasses import dataclass
 from .text_context import set_context, reset_context
-from .graph import VG_MGR, VisualCudaGraph
-
+from .pld_utils import pld_lookup_drafts
+from .lookahead_n_gram import NGramMgr
 import itertools
 
+
+LOOKAHEAD_3_GRAM: NGramMgr = NGramMgr()
 
 class PhaseTimer:
     """Global timer for profiling visual / prefill / decode phases."""
@@ -179,7 +183,9 @@ class Qwen3VLModel(nn.Module):
         position_ids: torch.LongTensor | None = None,
         inputs_embeds: torch.FloatTensor | None = None,
         pixel_values: torch.Tensor | None = None,
+        pixel_values_videos: torch.FloatTensor | None = None,
         image_grid_thw: torch.LongTensor | None = None,
+        video_grid_thw: torch.LongTensor | None = None,
         mm_token_type_ids: torch.IntTensor | None = None
     ) -> tuple | Qwen3VLModelOutputWithPast:
         """
@@ -245,9 +251,9 @@ class Qwen3VLModel(nn.Module):
             The temporal, height and width of feature shape of each image in LLM.
         """
         pixel_values = pixel_values.type(self.visual.dtype)
-        vg = VG_MGR.get(self.visual, image_grid_thw)
-        vision_output = vg.run(pixel_values, image_grid_thw)
-
+        vision_output: BaseModelOutputWithDeepstackFeatures = self.visual(
+            pixel_values, grid_thw=image_grid_thw
+        )
         image_embeds = vision_output.pooler_output
         split_sizes = (image_grid_thw.prod(-1) // self.visual.spatial_merge_size**2).tolist()
         image_embeds = torch.split(image_embeds, split_sizes)
@@ -275,14 +281,17 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         self.generation_config = GenerationConfig.from_model_config(config)
 
         self.block_size = block_size
-    
+        self._vocab_size = config.text_config.vocab_size
+
     def forward(
         self,
         input_ids: torch.LongTensor = None,
         position_ids: torch.LongTensor | None = None,
         inputs_embeds: torch.FloatTensor | None = None,
         pixel_values: torch.Tensor | None = None,
+        pixel_values_videos: torch.FloatTensor | None = None,
         image_grid_thw: torch.LongTensor | None = None,
+        video_grid_thw: torch.LongTensor | None = None,
         mm_token_type_ids: torch.IntTensor | None = None,
     ) -> tuple | Qwen3VLCausalLMOutputWithPast:
         """
@@ -291,7 +300,9 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         outputs = self.model(
             input_ids=input_ids,
             pixel_values=pixel_values,
+            pixel_values_videos=pixel_values_videos,
             image_grid_thw=image_grid_thw,
+            video_grid_thw=video_grid_thw,
             position_ids=position_ids,
             inputs_embeds=inputs_embeds,
             mm_token_type_ids=mm_token_type_ids
@@ -360,6 +371,131 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         with torch.cuda.graph(self._decode_graph):
             self._g_next_token = self._decode_forward()
 
+        # 3-token PLD graph only if enabled (saves capture + memory)
+        if os.environ.get("USE_PLD", "0") == "1":
+            self._build_decode_graph3()
+
+    def _point_context_decode_g1(self):
+        set_context(
+            False,
+            slot_mapping=self._g_slot_mapping,
+            context_lens=self._g_context_lens,
+            block_tables=self._g_block_tables,
+        )
+
+    def _point_context_decode_g3(self):
+        set_context(
+            False,
+            slot_mapping=self._g3_slot_mapping,
+            context_lens=self._g_context_lens,
+            block_tables=self._g_block_tables,
+        )
+
+    def _build_decode_graph3(self):
+        """CUDA graph for one forward over 3 new tokens (PLD verification)."""
+        device = self.device
+        vs = self._vocab_size
+        self._g3_input_ids = torch.zeros(3, dtype=torch.long, device=device)
+        self._g3_position_ids = torch.zeros(4, 3, dtype=torch.long, device=device)
+        self._g3_slot_mapping = torch.zeros(3, dtype=torch.int32, device=device)
+        self._g3_logits = torch.empty(3, vs, device=device, dtype=torch.float16)
+
+        self._point_context_decode_g3()
+        s = torch.cuda.Stream()
+        s.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(s):
+            for _ in range(3):
+                self._decode_forward3()
+        torch.cuda.current_stream().wait_stream(s)
+
+        self._decode_graph3 = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(self._decode_graph3):
+            self._g3_next_logits_argmax = self._decode_forward3()
+        self._point_context_decode_g1()
+    
+    
+    def _point_context_decode_g2(self):
+        set_context(
+            False,
+            slot_mapping=self._g2_slot_mapping,
+            context_lens=self._g_context_lens,
+            block_tables=self._g_block_tables,
+        )
+
+    def _decode_forward2(self):
+        """Three-token forward; copies logits for CPU verification after replay."""
+        outputs = self.forward(
+            input_ids=self._g2_input_ids,
+            position_ids=self._g2_position_ids,
+        )
+        self._g2_logits.copy_(outputs.logits)
+        return outputs.logits[0].argmax()
+    
+    def _build_decode_graph2(self):
+        """CUDA graph for one forward over x new tokens (PLD verification)."""
+        device = self.device
+        vs = self._vocab_size
+        self._g2_input_ids = torch.zeros(2, dtype=torch.long, device=device)
+        self._g2_position_ids = torch.zeros(4, 2, dtype=torch.long, device=device)
+        self._g2_slot_mapping = torch.zeros(2, dtype=torch.int32, device=device)
+        self._g2_logits = torch.empty(2, vs, device=device, dtype=torch.float16)
+
+        self._point_context_decode_g2()
+        s = torch.cuda.Stream()
+        s.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(s):
+            for _ in range(3):
+                self._decode_forward2()
+        torch.cuda.current_stream().wait_stream(s)
+
+        self._decode_graph2 = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(self._decode_graph2):
+            self._g2_next_logits_argmax = self._decode_forward2()
+        
+        # 默认
+        self._point_context_decode_g1()
+
+    def _point_context_decode_g4(self):
+        set_context(
+            False,
+            slot_mapping=self._g4_slot_mapping,
+            context_lens=self._g_context_lens,
+            block_tables=self._g_block_tables,
+        )
+
+    def _decode_forward4(self):
+        """Three-token forward; copies logits for CPU verification after replay."""
+        outputs = self.forward(
+            input_ids=self._g4_input_ids,
+            position_ids=self._g4_position_ids,
+        )
+        self._g4_logits.copy_(outputs.logits)
+        return outputs.logits[2].argmax()
+    
+    def _build_decode_graph4(self):
+        """CUDA graph for one forward over x new tokens (PLD verification)."""
+        device = self.device
+        vs = self._vocab_size
+        self._g4_input_ids = torch.zeros(4, dtype=torch.long, device=device)
+        self._g4_position_ids = torch.zeros(4, 4, dtype=torch.long, device=device)
+        self._g4_slot_mapping = torch.zeros(4, dtype=torch.int32, device=device)
+        self._g4_logits = torch.empty(4, vs, device=device, dtype=torch.float16)
+
+        self._point_context_decode_g4()
+        s = torch.cuda.Stream()
+        s.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(s):
+            for _ in range(3):
+                self._decode_forward4()
+        torch.cuda.current_stream().wait_stream(s)
+
+        self._decode_graph4 = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(self._decode_graph4):
+            self._g4_next_logits_argmax = self._decode_forward4()
+        
+        # 默认
+        self._point_context_decode_g1()
+
     def _decode_forward(self):
         """Single decode step on static graph buffers. Returns next_token (scalar)."""
         outputs = self.forward(
@@ -367,6 +503,103 @@ class Qwen3VLForConditionalGeneration(nn.Module):
             position_ids=self._g_position_ids,
         )
         return outputs.logits[0].argmax()
+
+    def _decode_forward3(self):
+        """Three-token forward; copies logits for CPU verification after replay."""
+        outputs = self.forward(
+            input_ids=self._g3_input_ids,
+            position_ids=self._g3_position_ids,
+        )
+        self._g3_logits.copy_(outputs.logits)
+        return outputs.logits[2].argmax()
+
+    def _accept_token_ids(self, words:List[int], preds:List[int], eos_ids):
+        if preds[0] in eos_ids:
+            return [], True
+        
+        # d1-> p1 总是有效decode
+        accept_ids = [preds[0]]
+        for i in range(len(preds)-1):
+            pred = preds[i]
+            word = words[i]
+            next_token = preds[i+1]
+            if pred != word:
+                return accept_ids, False
+            if pred in eos_ids:
+                return accept_ids, True
+            accept_ids.append(next_token)
+        return accept_ids, False
+
+    def _lookahead_decode_3(self, last_generated_token: int, kv_len, rope_delta_val, eos_ids, words:List[int]):
+        if not hasattr(self, "_decode_graph3"):
+                    self._build_decode_graph3()
+        ip_0, ip_1, ip_2 = last_generated_token, words[0], words[1]
+        self._g3_input_ids[0].fill_(ip_0)
+        self._g3_input_ids[1].fill_(ip_1)
+        self._g3_input_ids[2].fill_(ip_2)
+        for c in range(3):
+            p = kv_len + c + rope_delta_val
+            self._g3_position_ids[:, c].fill_(p)
+        self._g3_slot_mapping[0] = kv_len
+        self._g3_slot_mapping[1] = kv_len + 1
+        self._g3_slot_mapping[2] = kv_len + 2
+        self._g_context_lens.fill_(kv_len + 3)
+
+        self._point_context_decode_g3()
+        self._decode_graph3.replay()
+        torch.cuda.synchronize()
+
+
+        preds = self._g3_logits.argmax(dim=-1).tolist()
+        return self._accept_token_ids(words, preds, eos_ids)
+    
+
+    def _lookahead_decode_4(self, last_generated_token: int, kv_len, rope_delta_val, eos_ids, words:List[int]):
+        if not hasattr(self, "_decode_graph4"):
+                    self._build_decode_graph4()
+        ip_0, ip_1, ip_2, ip_3 = last_generated_token, words[0], words[1], words[2]
+        self._g4_input_ids[0].fill_(ip_0)
+        self._g4_input_ids[1].fill_(ip_1)
+        self._g4_input_ids[2].fill_(ip_2)
+        self._g4_input_ids[3].fill_(ip_3)
+        for c in range(4):
+            p = kv_len + c + rope_delta_val
+            self._g4_position_ids[:, c].fill_(p)
+        self._g4_slot_mapping[0] = kv_len
+        self._g4_slot_mapping[1] = kv_len + 1
+        self._g4_slot_mapping[2] = kv_len + 2
+        self._g4_slot_mapping[3] = kv_len + 3
+        self._g_context_lens.fill_(kv_len + 4)
+
+        self._point_context_decode_g4()
+        self._decode_graph4.replay()
+        torch.cuda.synchronize()
+
+
+        preds = self._g4_logits.argmax(dim=-1).tolist()
+        return self._accept_token_ids(words, preds, eos_ids)
+
+
+    def _lookahead_decode_2(self, last_generated_token: int, kv_len, rope_delta_val, eos_ids, words:List[int]):
+        if not hasattr(self, "_decode_graph2"):
+                    self._build_decode_graph2()
+        ip_0, ip_1 = last_generated_token, words[0]
+        self._g2_input_ids[0].fill_(ip_0)
+        self._g2_input_ids[1].fill_(ip_1)
+        for c in range(2):
+            p = kv_len + c + rope_delta_val
+            self._g2_position_ids[:, c].fill_(p)
+        self._g2_slot_mapping[0] = kv_len
+        self._g2_slot_mapping[1] = kv_len + 1
+        self._g_context_lens.fill_(kv_len + 2)
+
+        self._point_context_decode_g2()
+        self._decode_graph2.replay()
+        torch.cuda.synchronize()
+
+
+        preds = self._g2_logits.argmax(dim=-1).tolist()
+        return self._accept_token_ids(words, preds, eos_ids)
 
     # ---- generate ----
 
@@ -422,8 +655,17 @@ class Qwen3VLForConditionalGeneration(nn.Module):
             TIMER.record('prepare', (time.perf_counter() - _t_prep) * 1000)
 
         # --- Build decode graph on first call (before any prefill) ---
+        # use_pld = os.environ.get("USE_PLD", "0") == "1"
+        use_pld = True
         if not hasattr(self, '_decode_graph'):
             self.build_decode_graph()
+        if use_pld and not hasattr(self, '_decode_graph3'):
+            self._build_decode_graph3()
+        
+        if use_pld and not hasattr(self, '_decode_graph2'):
+            self._build_decode_graph2()
+        if use_pld and not hasattr(self, '_decode_graph4'):
+            self._build_decode_graph4()
 
         # --- Prefill (visual timing is inside Qwen3VLModel.forward) ---
         if _t:
@@ -435,7 +677,9 @@ class Qwen3VLForConditionalGeneration(nn.Module):
             input_ids=input_ids,
             position_ids=position_ids,
             pixel_values=pixel_values,
+            pixel_values_videos=pixel_values_videos,
             image_grid_thw=image_grid_thw,
+            video_grid_thw=video_grid_thw,
             mm_token_type_ids=mm_token_type_ids,
         )
 
@@ -459,17 +703,50 @@ class Qwen3VLForConditionalGeneration(nn.Module):
             torch.cuda.synchronize()
             _t_decode = time.perf_counter()
 
+        input_ids_copy = input_ids.tolist()
+        for i in range(len(input_ids_copy) -1, 1, -1):
+            if input_ids_copy[i] > self.generation_config.eos_token_id:
+                input_ids_copy = input_ids_copy[i+1:]
+                break
+
         for _ in range(max_new_tokens - 1):
+            
+            # kv_len = seq_len  # tokens in KV before this step
+            kv_len = seq_len + len(generated_ids) - 1 # tokens in KV before this step
+
+            words = None
+
+            if use_pld:
+                last_generated_token = generated_ids[-1]
+                words = LOOKAHEAD_3_GRAM.get_lookahead(last_generated_token)
+                # if last_generated_token == 28715:
+                    # words = [389, 279, 2383]
+                    # print('------------')
+            if (
+                use_pld
+                and words is not None
+            ):
+            # last_generated_token: int, kv_len, rope_delta_val, eos_ids, words
+                accept_ids, stop = self._lookahead_decode_3(last_generated_token, kv_len, rope_delta_val, eos_ids, words)
+                generated_ids.extend(accept_ids)
+                if LOOKAHEAD_3_GRAM.collect:
+                    LOOKAHEAD_3_GRAM.collect_hit(last_generated_token, len(words), len(accept_ids))
+                if stop:
+                    break
+            
+            # graph_1
+            next_token_val = generated_ids[-1]
+            all_seq_len = seq_len + len(generated_ids)
+
+            self._point_context_decode_g1()
             if next_token_val in eos_ids:
                 break
 
-            seq_len += 1
-
             # Fill static buffers with current step's values
             self._g_input_ids.fill_(next_token_val)
-            self._g_position_ids.fill_(seq_len - 1 + rope_delta_val)
-            self._g_slot_mapping.fill_(seq_len - 1)
-            self._g_context_lens.fill_(seq_len)
+            self._g_position_ids.fill_(all_seq_len - 1 + rope_delta_val)
+            self._g_slot_mapping.fill_(all_seq_len - 1)
+            self._g_context_lens.fill_(all_seq_len)
 
             # Replay captured graph
             self._decode_graph.replay()
@@ -481,6 +758,9 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         if _t:
             torch.cuda.synchronize()
             TIMER.record('decode', (time.perf_counter() - _t_decode) * 1000)
+
+        # 加入到lookahead词表
+        LOOKAHEAD_3_GRAM.add_words(generated_ids)
 
         # Reassemble output
         gen_tensor = torch.tensor(generated_ids, dtype=torch.long, device=device)

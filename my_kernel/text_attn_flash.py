@@ -64,8 +64,10 @@ class Attention(nn.Module):
                                        max_seqlen_q=context.max_seqlen_q, cu_seqlens_q=context.cu_seqlens_q,
                                        max_seqlen_k=context.max_seqlen_k, cu_seqlens_k=context.cu_seqlens_k,
                                        softmax_scale=self.scale, causal=True, block_table=context.block_tables)
-        else:    # decode
-            o = flash_attn_with_kvcache(q.unsqueeze(1), k_cache, v_cache,
-                                        cache_seqlens=context.context_lens, block_table=context.block_tables, 
+        else:    # decode — q: [seq_q, nheads, headdim]; FA expects [batch, seq_q, nheads, headdim]
+            o = flash_attn_with_kvcache(q.unsqueeze(0), k_cache, v_cache,
+                                        cache_seqlens=context.context_lens, block_table=context.block_tables,
                                         softmax_scale=self.scale, causal=True)
+            if o.dim() == 4 and o.shape[0] == 1:
+                o = o.squeeze(0)
         return o
